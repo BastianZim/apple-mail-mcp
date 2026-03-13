@@ -2,7 +2,8 @@
 
 A lightweight, **read-only** MCP server for Apple Mail on macOS.
 Reads directly from Mail's local SQLite database and `.emlx` files — no
-AppleScript needed for reading. Designed for large mailboxes (100K+ messages).
+AppleScript needed for reading. Designed for large mailboxes (tested with
+290K+ messages across multiple accounts).
 
 ## Features
 
@@ -11,6 +12,7 @@ AppleScript needed for reading. Designed for large mailboxes (100K+ messages).
 - **Deterministic file lookup** — `.emlx` files located via a cached directory map, no `rglob` per message
 - **Read-only** — no send capability, no AppleScript, minimal attack surface
 - **Minimal dependencies** — just the `mcp` SDK and Python stdlib
+- **Multi-account support** — works with iCloud (IMAP), Exchange (EWS), Gmail, and other accounts configured in Mail.app
 
 ## Tools
 
@@ -42,6 +44,8 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
+Restart Claude Desktop after saving.
+
 ### From source
 
 ```bash
@@ -55,19 +59,23 @@ uv run apple-mail-mcp
 - macOS 10.15+ (Catalina or later)
 - Python 3.10+
 - Apple Mail configured with at least one account
-- **Full Disk Access** for Claude Desktop (see below)
+- **Full Disk Access** for the process running the server (see below)
 
 ### macOS permissions
 
 Apple Mail's database lives in `~/Library/Mail/`, which macOS protects.
-You must grant **Full Disk Access** to Claude Desktop:
+You must grant **Full Disk Access** to the process that runs the MCP server.
+
+For **Claude Desktop** using `uvx`:
 
 1. Open **System Settings → Privacy & Security → Full Disk Access**
 2. Click the **+** button
-3. Navigate to `/Applications` and add **Claude.app**
+3. Add the `uvx` binary (typically at `/opt/homebrew/bin/uvx`)
 4. Restart Claude Desktop
 
 Without this, the server will fail with `unable to open database file`.
+
+> **Tip:** To find where `uvx` lives on your system, run `which uvx` in your terminal.
 
 ## How it works
 
