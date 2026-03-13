@@ -14,9 +14,13 @@ uv run apple-mail-mcp
 
 # Install dependencies
 uv sync
-```
 
-There are no tests or linting configured yet.
+# Run tests
+uv run --group dev pytest tests/ -v
+
+# Run a single test
+uv run --group dev pytest tests/test_maildb.py::TestCoreDataToIso::test_known_date -v
+```
 
 ## Architecture
 
