@@ -31,9 +31,9 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "uv",
+      "command": "uvx",
       "args": [
-        "run", "--from",
+        "--from",
         "git+https://github.com/BastianZim/apple-mail-mcp",
         "apple-mail-mcp"
       ]
