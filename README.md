@@ -23,7 +23,7 @@ AppleScript needed for reading. Designed for large mailboxes (100K+ messages).
 
 ## Installation
 
-### With `uv` (recommended)
+### With `uvx` (recommended)
 
 Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -55,6 +55,19 @@ uv run apple-mail-mcp
 - macOS 10.15+ (Catalina or later)
 - Python 3.10+
 - Apple Mail configured with at least one account
+- **Full Disk Access** for Claude Desktop (see below)
+
+### macOS permissions
+
+Apple Mail's database lives in `~/Library/Mail/`, which macOS protects.
+You must grant **Full Disk Access** to Claude Desktop:
+
+1. Open **System Settings → Privacy & Security → Full Disk Access**
+2. Click the **+** button
+3. Navigate to `/Applications` and add **Claude.app**
+4. Restart Claude Desktop
+
+Without this, the server will fail with `unable to open database file`.
 
 ## How it works
 
