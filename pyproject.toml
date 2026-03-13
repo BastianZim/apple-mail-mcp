@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apple-mail-mcp"
+version = "0.1.0"
+description = "A lightweight, read-only MCP server for Apple Mail. Designed for large mailboxes."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+apple-mail-mcp = "apple_mail_mcp.server:main"
