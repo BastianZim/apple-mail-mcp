@@ -8,6 +8,7 @@ import email.policy
 import logging
 import re
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from email.header import decode_header
 from pathlib import Path
@@ -174,12 +175,63 @@ class MailDatabase:
         finally:
             conn.close()
 
+    # ------------------------------------------------------------------
+    # Spotlight body search
+    # ------------------------------------------------------------------
+
+    def _spotlight_search(self, text: str, max_ids: int = 2000) -> list[int]:
+        """Search email body content via macOS Spotlight (mdfind).
+
+        Returns message IDs whose body matches *text*.  Spotlight
+        maintains a pre-built full-text index over .emlx files, so this
+        is fast even across hundreds of thousands of messages.
+        """
+        # Escape single quotes for the mdfind query string
+        safe_text = text.replace("'", "\\'")
+        query = (
+            f"kMDItemTextContent == '*{safe_text}*'cd"
+            f" && kMDItemContentType == 'com.apple.mail.emlx'"
+        )
+        try:
+            proc = subprocess.run(
+                ["mdfind", "-onlyin", str(self.v10_dir), query],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                logger.warning("mdfind failed: %s", proc.stderr.strip())
+                return []
+
+            message_ids: list[int] = []
+            for line in proc.stdout.strip().splitlines():
+                if not line:
+                    continue
+                # Path looks like …/Messages/12345.emlx (or 12345.partial.emlx)
+                stem = Path(line).stem          # "12345" or "12345.partial"
+                numeric = stem.split(".")[0]     # "12345"
+                try:
+                    message_ids.append(int(numeric))
+                except ValueError:
+                    continue
+                if len(message_ids) >= max_ids:
+                    break
+            return message_ids
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Spotlight search timed out after 30 s")
+            return []
+        except Exception as exc:
+            logger.warning("Spotlight search error: %s", exc)
+            return []
+
     def search_emails(
         self,
         *,
         query: Optional[str] = None,
         sender: Optional[str] = None,
         subject: Optional[str] = None,
+        body: Optional[str] = None,
         mailbox_id: Optional[int] = None,
         unread_only: bool = False,
         date_from: Optional[str] = None,
@@ -196,6 +248,7 @@ class MailDatabase:
             query:       Free-text across sender and subject.
             sender:      Substring match on sender address / display name.
             subject:     Substring match on subject line.
+            body:        Full-text search in message body via Spotlight.
             mailbox_id:  Restrict to a specific mailbox (from list_mailboxes).
             unread_only: If True, only unread messages.
             date_from:   ISO date string, inclusive lower bound.
@@ -208,6 +261,17 @@ class MailDatabase:
 
         conditions = ["m.deleted = 0"]
         params: list[Any] = []
+
+        # Body search via Spotlight — get matching message IDs first
+        if body:
+            matched_ids = self._spotlight_search(body)
+            if not matched_ids:
+                return []  # no body matches → empty result
+            # Use a direct IN clause with integer literals (safe — IDs are
+            # parsed from filenames, not user input).
+            id_list = ", ".join(str(i) for i in matched_ids)
+            conditions.append(f"m.ROWID IN ({id_list})")
+
 
         if unread_only:
             conditions.append("m.read = 0")
