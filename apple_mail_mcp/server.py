@@ -63,6 +63,7 @@ def search_emails(
     query: Optional[str] = None,
     sender: Optional[str] = None,
     subject: Optional[str] = None,
+    body: Optional[str] = None,
     mailbox_id: Optional[int] = None,
     unread_only: bool = False,
     date_from: Optional[str] = None,
@@ -79,6 +80,7 @@ def search_emails(
         query:       Free-text search across sender and subject.
         sender:      Substring match on sender address or display name.
         subject:     Substring match on subject line.
+        body:        Full-text search in message body (uses macOS Spotlight).
         mailbox_id:  Restrict to a specific mailbox (get ids from list_mailboxes).
         unread_only: Only return unread messages.
         date_from:   ISO date for start of range, e.g. '2025-01-01'.
@@ -91,6 +93,7 @@ def search_emails(
             query=query,
             sender=sender,
             subject=subject,
+            body=body,
             mailbox_id=mailbox_id,
             unread_only=unread_only,
             date_from=date_from,
