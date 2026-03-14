@@ -8,6 +8,7 @@ import email.policy
 import logging
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from email.header import decode_header
 from pathlib import Path
@@ -18,6 +19,35 @@ logger = logging.getLogger(__name__)
 
 # Core Data epoch offset: seconds between 1970-01-01 and 2001-01-01
 _CORE_DATA_EPOCH = 978307200
+
+_EMLX_SUFFIXES = (".emlx", ".partial.emlx")
+_EXTRA_HEADERS = ("to", "cc", "reply-to")
+
+_MESSAGE_SELECT = """
+    SELECT
+        m.ROWID                        AS id,
+        COALESCE(addr.address, '')      AS sender_address,
+        COALESCE(addr.comment, '')      AS sender_name,
+        COALESCE(subj.subject, '(no subject)') AS subject,
+        m.date_received,
+        COALESCE(mb.url, '')            AS mailbox_url,
+        m.read,
+        m.mailbox                       AS mailbox_id
+    FROM messages m
+    LEFT JOIN addresses addr ON m.sender   = addr.ROWID
+    LEFT JOIN subjects  subj ON m.subject  = subj.ROWID
+    LEFT JOIN mailboxes mb   ON m.mailbox  = mb.ROWID"""
+
+# Pre-compiled regexes for HTML-to-text stripping
+_RE_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_RE_BLOCK_CLOSE = re.compile(r"</(p|div|tr|li)>", re.IGNORECASE)
+_RE_TAG = re.compile(r"<[^>]+>")
+_RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE special characters so they match literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class MailDatabase:
@@ -118,14 +148,36 @@ class MailDatabase:
             return f"{decoded_name} <{address}>" if address else decoded_name
         return address or "Unknown"
 
+    def _row_to_summary(self, row: sqlite3.Row) -> dict[str, Any]:
+        """Convert a message SQL row to a summary dict."""
+        return {
+            "id": row["id"],
+            "sender": self._format_sender(
+                row["sender_name"], row["sender_address"]
+            ),
+            "subject": self._decode_mime_header(row["subject"]),
+            "date": self._core_data_to_iso(row["date_received"]),
+            "mailbox": self._mailbox_display_name(row["mailbox_url"]),
+            "mailbox_id": row["mailbox_id"],
+            "read": bool(row["read"]),
+        }
+
+    def _find_emlx_path(self, message_id: int) -> Optional[Path]:
+        """Locate the .emlx file for a message across cached directories."""
+        for messages_dir in self._messages_dirs:
+            for suffix in _EMLX_SUFFIXES:
+                candidate = messages_dir / f"{message_id}{suffix}"
+                if candidate.exists():
+                    return candidate
+        return None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def list_accounts(self) -> list[dict[str, Any]]:
         """List mail accounts derived from mailbox URLs."""
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             cursor = conn.execute(
                 "SELECT DISTINCT url FROM mailboxes WHERE url IS NOT NULL AND url != ''"
             )
@@ -141,13 +193,10 @@ class MailDatabase:
             if not accounts:
                 return [{"info": "Could not extract accounts. Use list_mailboxes instead."}]
             return list(accounts.values())
-        finally:
-            conn.close()
 
     def list_mailboxes(self) -> list[dict[str, Any]]:
         """List all mailboxes with message and unread counts."""
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             cursor = conn.execute("""
                 SELECT
                     mb.ROWID   AS id,
@@ -161,51 +210,44 @@ class MailDatabase:
                 GROUP BY mb.ROWID, mb.url
                 ORDER BY total_messages DESC
             """)
-            results = []
-            for row in cursor:
-                results.append({
+            return [
+                {
                     "id": row["id"],
                     "name": self._mailbox_display_name(row["url"]),
                     "url": row["url"] or "",
                     "total_messages": row["total_messages"],
                     "unread": row["unread_count"] or 0,
-                })
-            return results
-        finally:
-            conn.close()
+                }
+                for row in cursor
+            ]
 
     # ------------------------------------------------------------------
     # Body search via .emlx file scanning
     # ------------------------------------------------------------------
 
-    def _emlx_body_contains(self, message_id: int, search_text: str) -> bool:
-        """Check if a message's .emlx body contains the search text.
-
-        Uses case-insensitive matching.
-        """
-        search_lower = search_text.lower()
-        for messages_dir in self._messages_dirs:
-            for suffix in (".emlx", ".partial.emlx"):
-                candidate = messages_dir / f"{message_id}{suffix}"
-                if candidate.exists():
-                    body, _ = self._parse_emlx(candidate)
-                    return search_lower in body.lower()
-        return False
-
     def _body_search(
         self,
         body_text: str,
         candidate_ids: list[int],
+        max_matches: int,
     ) -> list[int]:
         """Filter candidate message IDs by body content.
 
         Scans .emlx files for candidates and returns IDs whose body
-        contains the search text (case-insensitive).
+        contains the search text (case-insensitive).  Stops after
+        collecting ``max_matches`` hits.
         """
+        search_lower = body_text.lower()
         matched: list[int] = []
         for msg_id in candidate_ids:
-            if self._emlx_body_contains(msg_id, body_text):
+            path = self._find_emlx_path(msg_id)
+            if path is None:
+                continue
+            body, _ = self._parse_emlx(path)
+            if search_lower in body.lower():
                 matched.append(msg_id)
+                if len(matched) >= max_matches:
+                    break
         return matched
 
     def search_emails(
@@ -261,12 +303,12 @@ class MailDatabase:
 
         if sender:
             conditions.append("(addr.address LIKE ? ESCAPE '\\' OR addr.comment LIKE ? ESCAPE '\\')")
-            like = f"%{sender}%"
+            like = f"%{_escape_like(sender)}%"
             params.extend([like, like])
 
         if subject:
             conditions.append("subj.subject LIKE ? ESCAPE '\\'")
-            params.append(f"%{subject}%")
+            params.append(f"%{_escape_like(subject)}%")
 
         if query:
             conditions.append(
@@ -274,7 +316,7 @@ class MailDatabase:
                 " OR addr.comment LIKE ? ESCAPE '\\'"
                 " OR subj.subject LIKE ? ESCAPE '\\')"
             )
-            like_q = f"%{query}%"
+            like_q = f"%{_escape_like(query)}%"
             params.extend([like_q, like_q, like_q])
 
         if date_from:
@@ -315,23 +357,16 @@ class MailDatabase:
                 ORDER BY m.date_received DESC
                 LIMIT ?
             """
-            candidate_params = params + [candidate_limit]
-
-            conn = self._connect()
-            try:
-                rows = conn.execute(candidate_sql, candidate_params).fetchall()
+            with closing(self._connect()) as conn:
+                rows = conn.execute(candidate_sql, params + [candidate_limit]).fetchall()
                 candidate_ids = [row["id"] for row in rows]
-            finally:
-                conn.close()
 
             if not candidate_ids:
                 return []
 
-            # Scan .emlx files for body matches
-            matched_ids = self._body_search(body, candidate_ids)
-
-            if not matched_ids:
-                return []
+            # Scan .emlx files for body matches, stopping once we have
+            # enough to satisfy offset + limit
+            matched_ids = self._body_search(body, candidate_ids, offset + limit)
 
             # Apply offset and limit to matched IDs
             # (IDs are already in date_received DESC order)
@@ -340,134 +375,45 @@ class MailDatabase:
             if not paged_ids:
                 return []
 
-            # Fetch full metadata for the paged results
-            id_list = ", ".join(str(i) for i in paged_ids)
-            meta_sql = f"""
-                SELECT
-                    m.ROWID                        AS id,
-                    COALESCE(addr.address, '')      AS sender_address,
-                    COALESCE(addr.comment, '')      AS sender_name,
-                    COALESCE(subj.subject, '(no subject)') AS subject,
-                    m.date_received,
-                    COALESCE(mb.url, '')            AS mailbox_url,
-                    m.read,
-                    m.mailbox                       AS mailbox_id
-                FROM messages m
-                LEFT JOIN addresses addr ON m.sender   = addr.ROWID
-                LEFT JOIN subjects  subj ON m.subject  = subj.ROWID
-                LEFT JOIN mailboxes mb   ON m.mailbox  = mb.ROWID
-                WHERE m.ROWID IN ({id_list})
-                ORDER BY m.date_received DESC
-            """
-            conn = self._connect()
-            try:
-                rows = conn.execute(meta_sql).fetchall()
-                results = []
-                for row in rows:
-                    results.append({
-                        "id": row["id"],
-                        "sender": self._format_sender(
-                            row["sender_name"], row["sender_address"]
-                        ),
-                        "subject": self._decode_mime_header(row["subject"]),
-                        "date": self._core_data_to_iso(row["date_received"]),
-                        "mailbox": self._mailbox_display_name(row["mailbox_url"]),
-                        "mailbox_id": row["mailbox_id"],
-                        "read": bool(row["read"]),
-                    })
-                return results
-            finally:
-                conn.close()
+            # Fetch full metadata for the paged results using parameterized query
+            placeholders = ", ".join("?" for _ in paged_ids)
+            meta_sql = f"{_MESSAGE_SELECT}\n    WHERE m.ROWID IN ({placeholders})\n    ORDER BY m.date_received DESC"
+            with closing(self._connect()) as conn:
+                rows = conn.execute(meta_sql, paged_ids).fetchall()
+                return [self._row_to_summary(row) for row in rows]
 
         # Standard search without body (fast, SQL-only)
-        sql = f"""
-            SELECT
-                m.ROWID                        AS id,
-                COALESCE(addr.address, '')      AS sender_address,
-                COALESCE(addr.comment, '')      AS sender_name,
-                COALESCE(subj.subject, '(no subject)') AS subject,
-                m.date_received,
-                COALESCE(mb.url, '')            AS mailbox_url,
-                m.read,
-                m.mailbox                       AS mailbox_id
-            FROM messages m
-            LEFT JOIN addresses addr ON m.sender   = addr.ROWID
-            LEFT JOIN subjects  subj ON m.subject  = subj.ROWID
-            LEFT JOIN mailboxes mb   ON m.mailbox  = mb.ROWID
-            WHERE {where}
-            ORDER BY m.date_received DESC
-            LIMIT ? OFFSET ?
-        """
+        sql = f"{_MESSAGE_SELECT}\n    WHERE {where}\n    ORDER BY m.date_received DESC\n    LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
-            results = []
-            for row in rows:
-                results.append({
-                    "id": row["id"],
-                    "sender": self._format_sender(
-                        row["sender_name"], row["sender_address"]
-                    ),
-                    "subject": self._decode_mime_header(row["subject"]),
-                    "date": self._core_data_to_iso(row["date_received"]),
-                    "mailbox": self._mailbox_display_name(row["mailbox_url"]),
-                    "mailbox_id": row["mailbox_id"],
-                    "read": bool(row["read"]),
-                })
-            return results
-        finally:
-            conn.close()
+            return [self._row_to_summary(row) for row in rows]
 
     def read_email(self, message_id: int) -> dict[str, Any]:
         """Read full email content by message ID.
 
         Fetches metadata from the DB and body from the .emlx file on disk.
         """
-        conn = self._connect()
-        try:
-            row = conn.execute("""
-                SELECT
-                    m.ROWID                        AS id,
-                    COALESCE(addr.address, '')      AS sender_address,
-                    COALESCE(addr.comment, '')      AS sender_name,
-                    COALESCE(subj.subject, '(no subject)') AS subject,
-                    m.date_received,
-                    COALESCE(mb.url, '')            AS mailbox_url,
-                    m.read,
-                    m.mailbox                       AS mailbox_id
-                FROM messages m
-                LEFT JOIN addresses addr ON m.sender   = addr.ROWID
-                LEFT JOIN subjects  subj ON m.subject  = subj.ROWID
-                LEFT JOIN mailboxes mb   ON m.mailbox  = mb.ROWID
-                WHERE m.ROWID = ?
-            """, (message_id,)).fetchone()
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"{_MESSAGE_SELECT}\n    WHERE m.ROWID = ?",
+                (message_id,),
+            ).fetchone()
 
             if not row:
                 return {"error": f"Message {message_id} not found"}
 
             body, extra_headers = self._read_emlx(message_id)
 
-            result: dict[str, Any] = {
-                "id": row["id"],
-                "sender": self._format_sender(
-                    row["sender_name"], row["sender_address"]
-                ),
-                "subject": self._decode_mime_header(row["subject"]),
-                "date": self._core_data_to_iso(row["date_received"]),
-                "mailbox": self._mailbox_display_name(row["mailbox_url"]),
-                "read": bool(row["read"]),
-                "body": body,
-            }
+            result = self._row_to_summary(row)
+            result["body"] = body
 
-            for key in ("to", "cc", "reply-to"):
+            for key in _EXTRA_HEADERS:
                 if key in extra_headers:
                     result[key.replace("-", "_")] = extra_headers[key]
 
             return result
-        finally:
-            conn.close()
 
     # ------------------------------------------------------------------
     # .emlx handling
@@ -479,11 +425,9 @@ class MailDatabase:
         Checks each cached Messages/ directory.  Typically only ~10-50
         directories exist, so this is effectively O(1) per message.
         """
-        for messages_dir in self._messages_dirs:
-            for suffix in (".emlx", ".partial.emlx"):
-                candidate = messages_dir / f"{message_id}{suffix}"
-                if candidate.exists():
-                    return self._parse_emlx(candidate)
+        path = self._find_emlx_path(message_id)
+        if path is not None:
+            return self._parse_emlx(path)
         return "(message body not found on disk)", {}
 
     @staticmethod
@@ -504,7 +448,7 @@ class MailDatabase:
             body = MailDatabase._extract_text(msg)
 
             headers: dict[str, str] = {}
-            for hdr in ("to", "cc", "reply-to"):
+            for hdr in _EXTRA_HEADERS:
                 val = msg.get(hdr)
                 if val:
                     headers[hdr] = str(val)
@@ -551,13 +495,13 @@ class MailDatabase:
 
         if html_parts:
             raw = "\n".join(html_parts)
-            raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"</(p|div|tr|li)>", "\n", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"<[^>]+>", "", raw)
+            raw = _RE_BR.sub("\n", raw)
+            raw = _RE_BLOCK_CLOSE.sub("\n", raw)
+            raw = _RE_TAG.sub("", raw)
             for entity, char in (("&nbsp;", " "), ("&amp;", "&"),
                                   ("&lt;", "<"), ("&gt;", ">")):
                 raw = raw.replace(entity, char)
-            raw = re.sub(r"\n{3,}", "\n\n", raw)
+            raw = _RE_MULTI_NEWLINE.sub("\n\n", raw)
             return raw.strip()
 
         return "(no text content)"
