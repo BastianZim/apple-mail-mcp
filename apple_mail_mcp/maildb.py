@@ -8,7 +8,6 @@ import email.policy
 import logging
 import re
 import sqlite3
-import subprocess
 from datetime import datetime, timezone
 from email.header import decode_header
 from pathlib import Path
@@ -176,54 +175,38 @@ class MailDatabase:
             conn.close()
 
     # ------------------------------------------------------------------
-    # Spotlight body search
+    # Body search via .emlx file scanning
     # ------------------------------------------------------------------
 
-    def _spotlight_search(self, text: str, max_ids: int = 2000) -> list[int]:
-        """Search email body content via macOS Spotlight (mdfind).
+    def _emlx_body_contains(self, message_id: int, search_text: str) -> bool:
+        """Check if a message's .emlx body contains the search text.
 
-        Returns message IDs whose body matches *text*.  Spotlight
-        maintains a pre-built full-text index over .emlx files, so this
-        is fast even across hundreds of thousands of messages.
+        Uses case-insensitive matching.
         """
-        # Escape single quotes for the mdfind query string
-        safe_text = text.replace("'", "\\'")
-        query = (
-            f"kMDItemTextContent == '*{safe_text}*'cd"
-            f" && kMDItemContentType == 'com.apple.mail.emlx'"
-        )
-        try:
-            proc = subprocess.run(
-                ["mdfind", "-onlyin", str(self.v10_dir), query],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if proc.returncode != 0:
-                logger.warning("mdfind failed: %s", proc.stderr.strip())
-                return []
+        search_lower = search_text.lower()
+        for messages_dir in self._messages_dirs:
+            for suffix in (".emlx", ".partial.emlx"):
+                candidate = messages_dir / f"{message_id}{suffix}"
+                if candidate.exists():
+                    body, _ = self._parse_emlx(candidate)
+                    return search_lower in body.lower()
+        return False
 
-            message_ids: list[int] = []
-            for line in proc.stdout.strip().splitlines():
-                if not line:
-                    continue
-                # Path looks like …/Messages/12345.emlx (or 12345.partial.emlx)
-                stem = Path(line).stem          # "12345" or "12345.partial"
-                numeric = stem.split(".")[0]     # "12345"
-                try:
-                    message_ids.append(int(numeric))
-                except ValueError:
-                    continue
-                if len(message_ids) >= max_ids:
-                    break
-            return message_ids
+    def _body_search(
+        self,
+        body_text: str,
+        candidate_ids: list[int],
+    ) -> list[int]:
+        """Filter candidate message IDs by body content.
 
-        except subprocess.TimeoutExpired:
-            logger.warning("Spotlight search timed out after 30 s")
-            return []
-        except Exception as exc:
-            logger.warning("Spotlight search error: %s", exc)
-            return []
+        Scans .emlx files for candidates and returns IDs whose body
+        contains the search text (case-insensitive).
+        """
+        matched: list[int] = []
+        for msg_id in candidate_ids:
+            if self._emlx_body_contains(msg_id, body_text):
+                matched.append(msg_id)
+        return matched
 
     def search_emails(
         self,
@@ -244,11 +227,18 @@ class MailDatabase:
         All filters are AND-combined.  Returns metadata only — use
         ``read_email`` to fetch the full body.
 
+        When ``body`` is provided, the search works in two passes:
+        1. SQL filters narrow down candidates (sender, subject, date, etc.)
+        2. .emlx files of candidates are scanned for the body text.
+
+        If ``body`` is the *only* filter, the most recent 5000 messages
+        are scanned.  Combine with other filters for faster results.
+
         Args:
             query:       Free-text across sender and subject.
             sender:      Substring match on sender address / display name.
             subject:     Substring match on subject line.
-            body:        Full-text search in message body via Spotlight.
+            body:        Full-text search in message body (scans .emlx files).
             mailbox_id:  Restrict to a specific mailbox (from list_mailboxes).
             unread_only: If True, only unread messages.
             date_from:   ISO date string, inclusive lower bound.
@@ -261,17 +251,6 @@ class MailDatabase:
 
         conditions = ["m.deleted = 0"]
         params: list[Any] = []
-
-        # Body search via Spotlight — get matching message IDs first
-        if body:
-            matched_ids = self._spotlight_search(body)
-            if not matched_ids:
-                return []  # no body matches → empty result
-            # Use a direct IN clause with integer literals (safe — IDs are
-            # parsed from filenames, not user input).
-            id_list = ", ".join(str(i) for i in matched_ids)
-            conditions.append(f"m.ROWID IN ({id_list})")
-
 
         if unread_only:
             conditions.append("m.read = 0")
@@ -312,6 +291,95 @@ class MailDatabase:
 
         where = " AND ".join(conditions)
 
+        # When body search is requested, we need a two-pass approach:
+        # 1. Get candidate IDs from SQL (larger set)
+        # 2. Scan their .emlx files for the body text
+        # 3. Then fetch final metadata for matches with limit/offset
+        if body:
+            # Determine how many candidates to fetch for body scanning.
+            # If other filters are present, they'll narrow the set.
+            # If body is the only filter, cap at 5000 most recent.
+            has_other_filters = any([
+                query, sender, subject, mailbox_id,
+                unread_only, date_from, date_to,
+            ])
+            candidate_limit = 50000 if has_other_filters else 5000
+
+            candidate_sql = f"""
+                SELECT m.ROWID AS id
+                FROM messages m
+                LEFT JOIN addresses addr ON m.sender   = addr.ROWID
+                LEFT JOIN subjects  subj ON m.subject  = subj.ROWID
+                LEFT JOIN mailboxes mb   ON m.mailbox  = mb.ROWID
+                WHERE {where}
+                ORDER BY m.date_received DESC
+                LIMIT ?
+            """
+            candidate_params = params + [candidate_limit]
+
+            conn = self._connect()
+            try:
+                rows = conn.execute(candidate_sql, candidate_params).fetchall()
+                candidate_ids = [row["id"] for row in rows]
+            finally:
+                conn.close()
+
+            if not candidate_ids:
+                return []
+
+            # Scan .emlx files for body matches
+            matched_ids = self._body_search(body, candidate_ids)
+
+            if not matched_ids:
+                return []
+
+            # Apply offset and limit to matched IDs
+            # (IDs are already in date_received DESC order)
+            paged_ids = matched_ids[offset : offset + limit]
+
+            if not paged_ids:
+                return []
+
+            # Fetch full metadata for the paged results
+            id_list = ", ".join(str(i) for i in paged_ids)
+            meta_sql = f"""
+                SELECT
+                    m.ROWID                        AS id,
+                    COALESCE(addr.address, '')      AS sender_address,
+                    COALESCE(addr.comment, '')      AS sender_name,
+                    COALESCE(subj.subject, '(no subject)') AS subject,
+                    m.date_received,
+                    COALESCE(mb.url, '')            AS mailbox_url,
+                    m.read,
+                    m.mailbox                       AS mailbox_id
+                FROM messages m
+                LEFT JOIN addresses addr ON m.sender   = addr.ROWID
+                LEFT JOIN subjects  subj ON m.subject  = subj.ROWID
+                LEFT JOIN mailboxes mb   ON m.mailbox  = mb.ROWID
+                WHERE m.ROWID IN ({id_list})
+                ORDER BY m.date_received DESC
+            """
+            conn = self._connect()
+            try:
+                rows = conn.execute(meta_sql).fetchall()
+                results = []
+                for row in rows:
+                    results.append({
+                        "id": row["id"],
+                        "sender": self._format_sender(
+                            row["sender_name"], row["sender_address"]
+                        ),
+                        "subject": self._decode_mime_header(row["subject"]),
+                        "date": self._core_data_to_iso(row["date_received"]),
+                        "mailbox": self._mailbox_display_name(row["mailbox_url"]),
+                        "mailbox_id": row["mailbox_id"],
+                        "read": bool(row["read"]),
+                    })
+                return results
+            finally:
+                conn.close()
+
+        # Standard search without body (fast, SQL-only)
         sql = f"""
             SELECT
                 m.ROWID                        AS id,
