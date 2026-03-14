@@ -80,7 +80,9 @@ def search_emails(
         query:       Free-text search across sender and subject.
         sender:      Substring match on sender address or display name.
         subject:     Substring match on subject line.
-        body:        Full-text search in message body (uses macOS Spotlight).
+        body:        Full-text search in message body (scans .emlx files).
+                     Combine with other filters for faster results.
+                     If used alone, scans the 5000 most recent messages.
         mailbox_id:  Restrict to a specific mailbox (get ids from list_mailboxes).
         unread_only: Only return unread messages.
         date_from:   ISO date for start of range, e.g. '2025-01-01'.
