@@ -7,7 +7,7 @@ import email
 import email.policy
 from pathlib import Path
 
-from apple_mail_mcp.maildb import MailDatabase, _CORE_DATA_EPOCH
+from apple_mail_mcp.maildb import MailDatabase, _CORE_DATA_EPOCH, _escape_like
 
 
 # -- Timestamp conversion -----------------------------------------------------
@@ -176,3 +176,134 @@ class TestParseEmlx:
 
         body, headers = MailDatabase._parse_emlx(emlx_file)
         assert "Body here." in body
+
+
+# -- LIKE escaping ---------------------------------------------------------------
+
+
+class TestEscapeLike:
+    def test_no_special_chars(self):
+        assert _escape_like("hello") == "hello"
+
+    def test_percent_escaped(self):
+        assert _escape_like("50%") == "50\\%"
+
+    def test_underscore_escaped(self):
+        assert _escape_like("a_b") == "a\\_b"
+
+    def test_backslash_escaped(self):
+        assert _escape_like("a\\b") == "a\\\\b"
+
+    def test_all_specials(self):
+        assert _escape_like("%_\\") == "\\%\\_\\\\"
+
+
+# -- .emlx path lookup -----------------------------------------------------------
+
+
+class TestFindEmlxPath:
+    def setup_method(self):
+        self.db = object.__new__(MailDatabase)
+
+    def test_finds_emlx(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        emlx = messages_dir / "42.emlx"
+        emlx.write_bytes(b"dummy")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._find_emlx_path(42)
+        assert result == emlx
+
+    def test_finds_partial_emlx(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        partial = messages_dir / "42.partial.emlx"
+        partial.write_bytes(b"dummy")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._find_emlx_path(42)
+        assert result == partial
+
+    def test_prefers_emlx_over_partial(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        emlx = messages_dir / "42.emlx"
+        emlx.write_bytes(b"dummy")
+        (messages_dir / "42.partial.emlx").write_bytes(b"dummy")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._find_emlx_path(42)
+        assert result == emlx
+
+    def test_returns_none_when_missing(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        self.db._messages_dirs = [messages_dir]
+
+        assert self.db._find_emlx_path(999) is None
+
+    def test_searches_multiple_dirs(self, tmp_path: Path):
+        dir1 = tmp_path / "a.mbox" / "Messages"
+        dir2 = tmp_path / "b.mbox" / "Messages"
+        dir1.mkdir(parents=True)
+        dir2.mkdir(parents=True)
+        emlx = dir2 / "7.emlx"
+        emlx.write_bytes(b"dummy")
+        self.db._messages_dirs = [dir1, dir2]
+
+        assert self.db._find_emlx_path(7) == emlx
+
+
+# -- Body search with early termination -----------------------------------------
+
+
+class TestBodySearch:
+    def _make_emlx(self, messages_dir: Path, msg_id: int, body_text: str) -> None:
+        raw = f"From: test@test.com\r\nSubject: test\r\n\r\n{body_text}\r\n".encode()
+        content = f"{len(raw)}\n".encode() + raw
+        (messages_dir / f"{msg_id}.emlx").write_bytes(content)
+
+    def setup_method(self):
+        self.db = object.__new__(MailDatabase)
+
+    def test_matches_body_text(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        self._make_emlx(messages_dir, 1, "hello world")
+        self._make_emlx(messages_dir, 2, "goodbye world")
+        self._make_emlx(messages_dir, 3, "hello again")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._body_search("hello", [1, 2, 3], 10)
+        assert result == [1, 3]
+
+    def test_case_insensitive(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        self._make_emlx(messages_dir, 1, "Hello World")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._body_search("hello world", [1], 10)
+        assert result == [1]
+
+    def test_early_termination(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        for i in range(1, 6):
+            self._make_emlx(messages_dir, i, "match me")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._body_search("match", [1, 2, 3, 4, 5], 3)
+        assert result == [1, 2, 3]
+
+    def test_skips_missing_emlx(self, tmp_path: Path):
+        messages_dir = tmp_path / "test.mbox" / "Messages"
+        messages_dir.mkdir(parents=True)
+        self._make_emlx(messages_dir, 1, "hello")
+        # ID 2 has no .emlx file
+        self._make_emlx(messages_dir, 3, "hello")
+        self.db._messages_dirs = [messages_dir]
+
+        result = self.db._body_search("hello", [1, 2, 3], 10)
+        assert result == [1, 3]
